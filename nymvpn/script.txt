@@ -1,0 +1,164 @@
+#!/bin/bash
+
+linux_cli="nym-vpn-cli_0.1.0_ubuntu-22.04_amd64.zip"
+mac_cli="nym-vpn-cli_0.1.0_macos_x86_64.zip"
+mac_cli_arch="nym-vpn-cli_0.1.0_macos_x86_64.zip"
+download_page="https://github.com/nymtech/nym/releases/tag/nym-vpn-alpha-0.0.2"
+sandbox_env_url="https://raw.githubusercontent.com/nymtech/nym/develop/envs/sandbox.env"
+nym_vpn_cli_dir="$HOME/nym-vpn-cli-dir"
+endpoint="https://sandbox-nym-api1.nymtech.net/api/v1/gateways/described"
+read -p "are you running on Mac or Linux? (mac/linux/mac_arch): " machine
+
+case "$machine" in
+mac)
+    download="https://github.com/nymtech/nym/releases/download/nym-vpn-alpha-0.0.2/${mac_cli}"
+    file_name="nym-vpn-cli_0.1.0_macos_x86_64"
+    ;;
+linux)
+    download="https://github.com/nymtech/nym/releases/download/nym-vpn-alpha-0.0.2/${linux_cli}"
+    file_name="nym-vpn-cli_0.1.0_ubuntu-22.04_amd64"
+    ;;
+mac_arch)
+    download="https://github.com/nymtech/nym/releases/download/nym-vpn-alpha-0.0.2/${mac_cli_arch}"
+    file_name="nym-vpn-cli_0.1.0_macos_aarch64"
+    ;;
+*)
+    echo "invalid choice. please enter 'mac' or 'linux' or 'mac_arch'."
+    exit 1
+    ;;
+esac
+
+json_array=()
+echo "🚀 🏎 - please be patient, fetching entry points... 🚀 🏎 "
+
+data=$(curl -s "$endpoint" | jq -c '.[] | {host: .bond.gateway.host, hostname: .self_described.host_information.hostname, identity_key: .bond.gateway.identity_key, exitGateway: .self_described.ip_packet_router.address}')
+
+while IFS= read -r entry; do
+    host=$(echo "$entry" | jq -r '.host')
+    hostname=$(echo "$entry" | jq -r '.hostname')
+    identity_key=$(echo "$entry" | jq -r '.identity_key')
+    exit_gateway_address=$(echo "$entry" | jq -r '.exitGateway // empty')
+    valid_ip=$(echo "$host")
+
+    if [ -n "$exit_gateway_address" ]; then
+        exit_gateway="{\"address\": \"$exit_gateway_address\"}"
+    else
+        exit_gateway="{}"
+    fi
+
+    if [[ $valid_ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        country_info=$(curl -s "http://ipinfo.io/${valid_ip}/country" | tr -d '\n')
+        country_info_escaped=$(echo "$country_info" | tr -d '\n' | jq -aRs . | tr -d '"')
+    else
+        country_info_escaped=""
+    fi
+
+    json_object="{\"hostname\": \"$hostname\", \"identityKey\": \"$identity_key\", \"exitGateway\": $exit_gateway, \"location\": \"$country_info_escaped\"}"
+    json_array+=("$json_object")
+done < <(echo "$data")
+
+if [ $? -ne 0 ]; then
+    echo "error fetching data from endpoint."
+    exit 1
+fi
+
+echo "creating $nym_vpn_cli_dir directory..."
+mkdir -p "$nym_vpn_cli_dir"
+
+cd "$nym_vpn_cli_dir" || {
+    echo "failed to change directory. please check permissions."
+    exit 1
+}
+
+if ! command -v unzip &>/dev/null; then
+    echo "installing unzip..."
+    if command -v brew &>/dev/null; then
+        brew install unzip || {
+            echo "failed to install unzip using Homebrew. please install it manually."
+            exit 1
+        }
+    elif command -v apt-get &>/dev/null; then
+        sudo apt-get install -y unzip || {
+            echo "failed to install unzip using apt-get. please install it manually."
+            exit 1
+        }
+    else
+        echo "unzip is not installed, and neither Homebrew nor apt-get is available on your system."
+        echo "please install unzip manually."
+        exit 1
+    fi
+fi
+
+echo "downloading CLI..."
+curl -LO "$download"
+
+echo "unzipping CLI..."
+echo "$file_name".zip
+unzip -q "$file_name".zip
+
+echo "please enter the full text for example: checksum<value>*** nym-vpn-cli-macos-latest.zip as one string"
+read -p "what is the checksum presented on the downloads page for the zip file: ${download_page}?  " checksum
+
+if command -v sha256sum &>/dev/null; then
+    calculated_checksum=$(sha256sum "$file_name".zip)
+elif command -v shasum &>/dev/null; then
+    calculated_checksum=$(shasum -a 256 "$file_name".zip)
+else
+    echo "checksum tool not found. unable to verify the checksum. 🤔 "
+    exit 1
+fi
+
+file="nym-vpn-cli"
+
+if [ "$calculated_checksum" == "$checksum" ]; then
+    echo "checksum verified. download is valid."
+    chmod u+x $file
+else
+    echo "checksum does not match. the binary may be corrupted or tampered with - contact a nym member"
+    exit 1
+fi
+
+echo "downloading .env file..."
+curl -L "$sandbox_env_url" -o .env || {
+    echo "failed to download .env file. please check your internet connection."
+    exit 1
+}
+
+echo "script completed. the CLI and configuration files are in $nym_vpn_cli_dir."
+echo "let's launch the CLI."
+
+printf "%s\n" "${json_array[@]}" | jq -s .
+
+read -p "enter a gateway identity key: " identity_key
+read -p "enter an exit address: " exit_address
+
+read -p "do you want five hop or two hop? (five || two): " response
+case $response in
+two)
+    echo "launching 2 hop mixnet"
+    read -p "do you want to run WireGuard? (yes | no): " enable_wireguard
+    enable_wireguard=$(echo "$enable_wireguard" | tr '[:upper:]' '[:lower:]')
+
+    if [ "$enable_wireguard" == "yes" ]; then
+        read -p "enter WireGuard private key: " priv_key
+        read -p "enter WireGuard IP address: " wg_ip
+        sudo ./nym-vpn-cli -c .env --entry-gateway-id "$identity_key" --exit-router-address "$exit_address" --enable-wireguard --private-key "$priv_key" --wg-ip "$wg_ip"
+    else
+        sudo ./nym-vpn-cli -c .env --entry-gateway-id "$identity_key" --exit-router-address "$exit_address"
+    fi
+    ;;
+five)
+    echo "launching 5 hop mixnet"
+    read -p "do you want to run WireGuard? (yes | no): " enable_wireguard
+    enable_wireguard=$(echo "$enable_wireguard" | tr '[:upper:]' '[:lower:]')
+
+    if [ "$enable_wireguard" == "yes" ]; then
+        read -p "enter WireGuard private key: " priv_key
+        read -p "enter WireGuard IP address: " wg_ip
+        sudo ./nym-vpn-cli -c .env --entry-gateway-id "$identity_key" --exit-router-address "$exit_address" --enable-wireguard --private-key "$priv_key" --wg-ip "$wg_ip"
+    else
+        sudo ./nym-vpn-cli -c .env --entry-gateway-id "$identity_key" --exit-router-address "$exit_address"
+    fi
+    ;;
+*) ;;
+esac
